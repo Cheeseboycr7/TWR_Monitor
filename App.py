@@ -14,7 +14,7 @@ import time
 from flask import Flask, jsonify, render_template_string
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
-import serial
+import serial # allow the communication with devices through serial port
 
 # Initialize logging configuration immediately at the global level
 logging.basicConfig(
@@ -42,11 +42,11 @@ EXCEL_FILE = "./modulation_data.xlsx"
 def get_serial_device(device_file, baudrate=9600):
     """Initialize and return a configured serial connection."""
     return serial.Serial(
-        port=device_file,
-        baudrate=baudrate,
-        parity=serial.PARITY_NONE,
+        port=device_file, # serial port to connect to (eg "com3" on windows or "/dev/ttyUSB0" on Linux
+        baudrate=baudrate, # communication speed bits per second
+        parity=serial.PARITY_NONE, # no parity checking
         stopbits=serial.STOPBITS_ONE,
-        bytesize=serial.EIGHTBITS,
+        bytesize=serial.EIGHTBITS, # send and receive 8-bits bytes
         timeout=1
     )
 
@@ -191,14 +191,28 @@ def data_collection_worker():
 
 
 # HTML Interface embedded directly for a single-file portable solution
-DASHBOARD_HTML = """
+DASHBOARD_HTML: str = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>TWR Africa - AM Modulation Monitor Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TWR Africa — Belar AMMA-2 Real-Time Modulation Monitor</title>
     <style>
+        :root {
+            --bg-main: #0b0f19;
+            --bg-card: #111827;
+            --border-color: #1f2937;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --twr-blue: #00a3e0;
+            --twr-navy: #0f2c59;
+            --signal-ok: #10b981;
+            --signal-warn: #f59e0b;
+            --signal-crit: #ef4444;
+            --led-off: #1f2937;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -206,252 +220,109 @@ DASHBOARD_HTML = """
         }
 
         body {
-            font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #f4f7fa 0%, #e6ecf4 100%);
-            color: #1e293b;
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+            background-color: var(--bg-main);
+            color: var(--text-main);
             min-height: 100vh;
-            padding: 30px 20px;
+            padding: 24px;
         }
 
         .container {
-            max-width: 800px;
+            max-width: 1000px;
             margin: 0 auto;
-            animation: fadeIn 0.5s ease-out;
         }
 
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(15px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        /* TWR Official Header Styling */
+        /* Broadcast Console Rack-Mount Header Layout */
         .header {
-            background: #0f2c59; /* TWR Primary Deep Navy */
-            padding: 30px 35px;
-            border-radius: 12px 12px 0 0;
-            border-bottom: 4px solid #00a3e0; /* TWR Accent Blue */
-            box-shadow: 0 4px 15px rgba(15, 44, 89, 0.15);
-            position: relative;
-        }
-
-        h1 {
-            color: #ffffff;
-            font-size: 1.8rem;
-            font-weight: 700;
-            margin-bottom: 6px;
-            letter-spacing: -0.5px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-
-        .badge {
-            display: inline-block;
-            background: #00a3e0;
-            color: #ffffff;
-            font-size: 0.75rem;
-            padding: 4px 12px;
-            border-radius: 4px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        h2 {
-            color: #93c5fd;
-            font-size: 0.95rem;
-            font-weight: 400;
-            letter-spacing: 0.3px;
-        }
-
-        /* Status & Network Control Bar */
-        .status-bar {
+            background: linear-gradient(90deg, var(--twr-navy) 0%, #071630 100%);
+            padding: 20px 24px;
+            border-radius: 6px 6px 0 0;
+            border-bottom: 3px solid var(--twr-blue);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: #ffffff;
-            padding: 14px 25px;
-            border-radius: 0 0 12px 12px;
-            margin-bottom: 25px;
-            border: 1px solid #dbeafe;
-            border-top: none;
-            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.02);
+            flex-wrap: wrap;
+            gap: 16px;
         }
 
-        .live-indicator {
+        .header-title h1 {
+            font-size: 1.4rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: #ffffff;
             display: flex;
             align-items: center;
             gap: 10px;
         }
 
-        .pulse-dot {
-            width: 12px;
-            height: 12px;
-            background-color: #10b981; /* Stable green status operational flag */
-            border-radius: 50%;
-            animation: pulse 2.0s ease-in-out infinite;
-            box-shadow: 0 0 8px rgba(16, 185, 129, 0.4);
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.4; transform: scale(1.15); }
-        }
-
-        .live-text {
-            color: #0f2c59;
+        .header-title h2 {
+            color: var(--twr-blue);
             font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-top: 2px;
+        }
+
+        .system-badge {
+            background: rgba(0, 163, 224, 0.15);
+            border: 1px solid var(--twr-blue);
+            color: #ffffff;
+            font-size: 0.7rem;
+            padding: 4px 10px;
+            border-radius: 4px;
             font-weight: 700;
             letter-spacing: 0.5px;
         }
 
-        .refresh-info {
-            font-size: 0.85rem;
-            color: #475569;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        /* Professional Metric Cards Layout */
-        .metric-grid {
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-            margin-bottom: 25px;
-        }
-
-        .metric-card {
-            background: #ffffff;
-            border-radius: 8px;
-            transition: all 0.2s ease;
-            border: 1px solid #e2e8f0;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.02);
-            overflow: hidden;
-        }
-
-        .metric-card:hover {
-            transform: translateX(4px);
-            border-left: 5px solid #00a3e0;
-            box-shadow: 0 6px 12px rgba(15, 44, 89, 0.06);
-        }
-
-        .metric-content {
+        /* Master Control Status Bar */
+        .status-bar {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-top: none;
+            padding: 12px 24px;
+            border-radius: 0 0 6px 6px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 20px 25px;
-        }
-
-        .metric-info {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            flex: 1;
-        }
-
-        .metric-label {
+            margin-bottom: 20px;
             font-size: 0.85rem;
-            font-weight: 700;
-            color: #0f2c59;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 600;
             letter-spacing: 0.5px;
         }
 
-        .metric-description {
-            font-size: 0.75rem;
-            color: #64748b;
+        .pulse-dot {
+            width: 10px;
+            height: 10px;
+            background-color: var(--signal-ok);
+            border-radius: 50%;
+            animation: telemetryPulse 1.5s ease-in-out infinite;
+            box-shadow: 0 0 8px var(--signal-ok);
         }
 
-        .metric-value {
-            font-size: 1.8rem;
-            font-weight: 700;
-            color: #0f2c59;
-            background: #f8fafc;
-            padding: 10px 20px;
-            border-radius: 6px;
-            min-width: 130px;
-            text-align: center;
-            font-family: 'Courier New', monospace;
-            border: 1px solid #e2e8f0;
-            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.02);
-            transition: all 0.2s ease;
+        @keyframes telemetryPulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(1.1); }
         }
 
-        /* Warning/Caution Highlights for AM Noise Floor */
-        .metric-card.noise:hover {
-            border-left-color: #d97706;
-        }
-        .metric-card.noise .metric-value {
-            color: #d97706;
-            background: #fffb701a;
-        }
-
-        /* Progress Bar for Modulation */
-        .modulation-bar {
-            margin-top: 10px;
-            height: 6px;
-            background: #e2e8f0;
-            border-radius: 3px;
-            overflow: hidden;
-            max-width: 85%;
-        }
-
-        .modulation-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #00a3e0, #0f2c59);
-            width: 0%;
-            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            border-radius: 3px;
-        }
-
-        /* TWR Corporate Style Footer */
-        .footer {
-            background: #ffffff;
-            padding: 22px;
-            border-radius: 8px;
-            text-align: center;
-            border: 1px solid #e2e8f0;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.02);
-        }
-
-        .timestamp {
-            font-size: 0.9rem;
-            color: #1e293b;
-            margin-bottom: 12px;
+        .refresh-controls {
             display: flex;
             align-items: center;
-            justify-content: center;
-            gap: 8px;
+            gap: 16px;
+            color: var(--text-muted);
         }
 
-        .timestamp strong {
-            color: #00a3e0;
-        }
-
-        .footer-note {
-            font-size: 0.75rem;
-            color: #64748b;
-            display: flex;
-            justify-content: center;
-            gap: 24px;
-            flex-wrap: wrap;
-            border-top: 1px solid #f1f5f9;
-            padding-top: 12px;
-        }
-
-        .footer-note span {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        /* Interactive Auto-refresh Buttons */
-        .auto-refresh-toggle {
-            background: #0f2c59;
-            border: none;
-            color: #ffffff;
-            padding: 5px 14px;
+        .refresh-btn {
+            background: #1f2937;
+            border: 1px solid #374151;
+            color: var(--text-main);
+            padding: 4px 12px;
             border-radius: 4px;
             font-size: 0.75rem;
             font-weight: 600;
@@ -459,127 +330,320 @@ DASHBOARD_HTML = """
             transition: all 0.2s ease;
         }
 
-        .auto-refresh-toggle:hover {
-            background: #00a3e0;
-            transform: translateY(-1px);
+        .refresh-btn:hover {
+            background: #374151;
+            border-color: #4b5563;
         }
 
-        /* Structural Responsive Breakpoints */
-        @media (max-width: 600px) {
-            body { padding: 15px 10px; }
-            .metric-content {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 15px;
-                padding: 18px 20px;
+        /* High-Density Signal Monitoring Grid Layout */
+        .telemetry-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .telemetry-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 16px 20px;
+            display: grid;
+            grid-template-columns: 280px 1fr 140px;
+            align-items: center;
+            gap: 24px;
+            position: relative;
+        }
+
+        /* Layout fallback adjustments for ancillary metrics without hardware meters */
+        .telemetry-card.no-meter {
+            grid-template-columns: 280px 1fr 140px;
+        }
+
+        .telemetry-card.no-meter .meter-wrapper {
+            display: flex;
+            align-items: center;
+            color: #4b5563;
+            font-size: 0.8rem;
+            font-style: italic;
+            letter-spacing: 0.5px;
+        }
+
+        .metric-details {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .metric-tag {
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: #ffffff;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .metric-tag span {
+            font-size: 0.7rem;
+            background: #1f2937;
+            padding: 1px 6px;
+            border-radius: 3px;
+            color: var(--twr-blue);
+        }
+
+        .metric-desc {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        /* Hardware LED Segment Display Engineering Emulator */
+        .meter-wrapper {
+            width: 100%;
+        }
+
+        .led-strip {
+            display: flex;
+            gap: 3px;
+            background: #020617;
+            padding: 6px;
+            border-radius: 4px;
+            border: 1px solid #1e293b;
+        }
+
+        .led-segment {
+            flex: 1;
+            height: 14px;
+            background-color: var(--led-off);
+            border-radius: 1px;
+            transition: background-color 0.1s ease;
+        }
+
+        /* Master Scale Labels below the meter segments */
+        .scale-labels {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.65rem;
+            color: #4b5563;
+            font-weight: 700;
+            padding: 0 2px;
+        }
+
+        /* Digital Nixie Tube Display Box */
+        .readout-container {
+            text-align: right;
+        }
+
+        .digital-readout {
+            font-family: 'Courier New', monospace;
+            font-size: 1.7rem;
+            font-weight: 700;
+            color: var(--signal-ok);
+            background-color: #050b14;
+            border: 1px solid #1e293b;
+            padding: 6px 12px;
+            border-radius: 4px;
+            display: inline-block;
+            min-width: 120px;
+            text-align: center;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.8);
+            letter-spacing: -0.5px;
+        }
+
+        /* Specific Status Variations based on RF compliance math thresholds */
+        .telemetry-card.alert-flash .digital-readout {
+            color: var(--signal-crit) !important;
+            animation: criticalFlash 0.5s ease-in-out infinite alternate;
+        }
+
+        @keyframes criticalFlash {
+            0% { box-shadow: inset 0 2px 4px rgba(0,0,0,0.8); }
+            100% { box-shadow: inset 0 0 12px rgba(239, 68, 68, 0.4); border-color: var(--signal-crit); }
+        }
+
+        .telemetry-card.warn-state .digital-readout {
+            color: var(--signal-warn) !important;
+        }
+
+        /* Monitoring Station System Footer Configuration */
+        .footer {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 16px 24px;
+            font-size: 0.8rem;
+        }
+
+        .sync-time {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+            color: var(--text-main);
+        }
+
+        .sync-time strong {
+            color: var(--twr-blue);
+            font-family: 'Courier New', monospace;
+        }
+
+        .metadata-line {
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            border-top: 1px solid var(--border-color);
+            padding-top: 12px;
+            color: var(--text-muted);
+        }
+
+        .metadata-line span strong {
+            color: var(--text-main);
+        }
+
+        /* Responsive Breakpoints for Field Inspection Terminals */
+        @media (max-width: 850px) {
+            .telemetry-card {
+                grid-template-columns: 1fr;
+                gap: 12px;
             }
-            .metric-value { width: 100%; text-align: center; }
-            .modulation-bar { max-width: 100%; }
-            h1 { font-size: 1.4rem; }
-            .status-bar { flex-direction: column; gap: 10px; text-align: center; }
+            .readout-container {
+                text-align: left;
+            }
+            .digital-readout {
+                width: 100%;
+            }
         }
 
-        /* Data Update Flash Highlight Class */
-        .value-updating {
-            animation: valuePulse 0.4s ease-in-out;
+        /* Live Data Transit Interception Flash */
+        .data-pulse {
+            animation: visualCommit 0.3s ease-out;
         }
 
-        @keyframes valuePulse {
-            0%, 100% { transform: scale(1); background: #f8fafc; }
-            50% { transform: scale(1.03); background: #e0f2fe; border-color: #00a3e0; }
+        @keyframes visualCommit {
+            0% { opacity: 0.7; transform: scale(0.995); }
+            100% { opacity: 1; transform: scale(1); }
         }
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- Rack Frame Top Header -->
         <div class="header">
-            <h1>
-                📡 TWR Africa — AM Modulation Monitor
-                <span class="badge">Live telemetry</span>
-            </h1>
-            <h2>Belar AMMA-2 Precision Automated Monitoring Terminal</h2>
+            <div class="header-title">
+                <h1>📡 TWR AFRICA — AM MONITORING BRIDGE</h1>
+                <h2>Belar AMMA-2 Precision Receiver Node</h2>
+            </div>
+            <div class="system-badge">LINK: TELEMETRY DOWNLINK</div>
         </div>
 
+        <!-- System Diagnostic Line -->
         <div class="status-bar">
-            <div class="live-indicator">
-                <div class="pulse-dot"></div>
-                <span class="live-text">MONITORING ENGINE OPERATIONAL</span>
+            <div class="status-indicator">
+                <div class="pulse-dot" id="sysPulse"></div>
+                <span id="sysStatusText">CONSOLE STREAMING ACTIVE</span>
             </div>
-            <div class="refresh-info">
-                <span>🔄 Refreshing in: <strong id="refreshCounter">5</strong>s</span>
-                <button class="auto-refresh-toggle" onclick="toggleAutoRefresh()">⏸️ Pause Stream</button>
-            </div>
-        </div>
-
-        <div class="metric-grid">
-            <div class="metric-card" data-metric="DA">
-                <div class="metric-content">
-                    <div class="metric-info">
-                        <div class="metric-label">NEGATIVE PEAK MODULATION (DA)</div>
-                        <div class="metric-description">Maximum negative carrier signal deviation parameters</div>
-                        <div class="modulation-bar">
-                            <div class="modulation-fill" id="barDA"></div>
-                        </div>
-                    </div>
-                    <div class="metric-value" id="valueDA">{{ telemetry.DA }}</div>
-                </div>
-            </div>
-
-            <div class="metric-card" data-metric="DB">
-                <div class="metric-content">
-                    <div class="metric-info">
-                        <div class="metric-label">POSITIVE PEAK MODULATION (DB)</div>
-                        <div class="metric-description">Maximum positive carrier signal peak overshoot depth</div>
-                        <div class="modulation-bar">
-                            <div class="modulation-fill" id="barDB"></div>
-                        </div>
-                    </div>
-                    <div class="metric-value" id="valueDB">{{ telemetry.DB }}</div>
-                </div>
-            </div>
-
-            <div class="metric-card" data-metric="DG">
-                <div class="metric-content">
-                    <div class="metric-info">
-                        <div class="metric-label">UNMODULATED CARRIER REFERENCE (DG)</div>
-                        <div class="metric-description">Relative baseline unmodulated RF carrier reference level</div>
-                    </div>
-                    <div class="metric-value" id="valueDG">{{ telemetry.DG }}</div>
-                </div>
-            </div>
-
-            <div class="metric-card noise" data-metric="DH">
-                <div class="metric-content">
-                    <div class="metric-info">
-                        <div class="metric-label">RESIDUAL AM NOISE FLOOR (DH)</div>
-                        <div class="metric-description">Total integrated residual noise floor and AM noise floor</div>
-                    </div>
-                    <div class="metric-value" id="valueDH">{{ telemetry.DH }}</div>
-                </div>
-            </div>
-
-            <div class="metric-card" data-metric="DN">
-                <div class="metric-content">
-                    <div class="metric-info">
-                        <div class="metric-label">AVERAGE RMS MODULATION DEPTH (DN)</div>
-                        <div class="metric-description">Continuous dynamic Root-Mean-Square average audio energy</div>
-                        <div class="modulation-bar">
-                            <div class="modulation-fill" id="barDN"></div>
-                        </div>
-                    </div>
-                    <div class="metric-value" id="valueDN">{{ telemetry.DN }}</div>
-                </div>
+            <div class="refresh-controls">
+                <span>CADENCE: <strong id="refreshCounter" style="color: var(--text-main);">5</strong>s</span>
+                <button class="refresh-btn" onclick="toggleAutoRefresh()">⏸ PAUSE BUS</button>
             </div>
         </div>
 
+        <!-- Operational Instruments Matrix Stack -->
+        <div class="telemetry-grid">
+
+            <!-- INSTRUMENT 1: NEGATIVE PEAK (DA) -->
+            <div class="telemetry-card" id="cardDA">
+                <div class="metric-details">
+                    <div class="metric-tag">NEGATIVE PEAK MODULATION <span>DA</span></div>
+                    <div class="metric-desc">Carrier dropout evaluation (Limit: 100% standard envelope safety)</div>
+                </div>
+                <div class="meter-wrapper">
+                    <div class="led-strip" id="stripDA"></div>
+                    <div class="scale-labels">
+                        <span>0%</span><span>20</span><span>40</span><span>60</span><span>80</span><span>100%</span><span>120</span><span>140%</span>
+                    </div>
+                </div>
+                <div class="readout-container">
+                    <div class="digital-readout" id="valueDA">{{ telemetry.DA }}</div>
+                </div>
+            </div>
+
+            <!-- INSTRUMENT 2: POSITIVE PEAK (DB) -->
+            <div class="telemetry-card" id="cardDB">
+                <div class="metric-details">
+                    <div class="metric-tag">POSITIVE PEAK MODULATION <span>DB</span></div>
+                    <div class="metric-desc">Asymmetric envelope modulation crest factor (Max allocation: 125%)</div>
+                </div>
+                <div class="meter-wrapper">
+                    <div class="led-strip" id="stripDB"></div>
+                    <div class="scale-labels">
+                        <span>0%</span><span>20</span><span>40</span><span>60</span><span>80</span><span>100%</span><span>120</span><span>140%</span>
+                    </div>
+                </div>
+                <div class="readout-container">
+                    <div class="digital-readout" id="valueDB">{{ telemetry.DB }}</div>
+                </div>
+            </div>
+
+            <!-- INSTRUMENT 3: CARRIER REFERENCE (DG) -->
+            <div class="telemetry-card no-meter" id="cardDG">
+                <div class="metric-details">
+                    <div class="metric-tag">UNMODULATED CARRIER REFERENCE <span>DG</span></div>
+                    <div class="metric-desc">RF power engine normalization calibration level</div>
+                </div>
+                <div class="meter-wrapper">
+                    <div>[ Dynamic Linear Reference Signal - Static Variable Tracking ]</div>
+                </div>
+                <div class="readout-container">
+                    <div class="digital-readout" id="valueDG" style="color: #38bdf8;">{{ telemetry.DG }}</div>
+                </div>
+            </div>
+
+            <!-- INSTRUMENT 4: AM NOISE FLOOR (DH) -->
+            <div class="telemetry-card no-meter" id="cardDH">
+                <div class="metric-details">
+                    <div class="metric-tag">RESIDUAL AM NOISE FLOOR <span>DH</span></div>
+                    <div class="metric-desc">Integrated thermal noise &amp; residual interference (Target &lt; -50dB)</div>
+                </div>
+                <div class="meter-wrapper">
+                    <div>[ Spectrum Isolation Subsystem - Decibel Logarithmic Value ]</div>
+                </div>
+                <div class="readout-container">
+                    <div class="digital-readout" id="valueDH">{{ telemetry.DH }}</div>
+                </div>
+            </div>
+
+            <!-- INSTRUMENT 5: RMS MODULATION (DN) -->
+            <div class="telemetry-card" id="cardDN">
+                <div class="metric-details">
+                    <div class="metric-tag">AVERAGE RMS MODULATION DEPTH <span>DN</span></div>
+                    <div class="metric-desc">Integrated root-mean-square continuous audio energy levels</div>
+                </div>
+                <div class="meter-wrapper">
+                    <div class="led-strip" id="stripDN"></div>
+                    <div class="scale-labels">
+                        <span>0%</span><span>20</span><span>40</span><span>60</span><span>80</span><span>100%</span><span>120%</span>
+                    </div>
+                </div>
+                <div class="readout-container">
+                    <div class="digital-readout" id="valueDN">{{ telemetry.DN }}</div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Infrastructure Meta Blocks -->
         <div class="footer">
-            <div class="timestamp">
-                <span>Last Telemetry Sync: <strong id="lastUpdated">{{ telemetry.last_updated }}</strong></span>
+            <div class="sync-time">
+                ⏱ Master Bus Sync: <strong id="lastUpdated">{{ telemetry.last_updated }}</strong>
             </div>
-            <div class="footer-note">
-                <span>💾 Active Storage: <strong>data.log</strong> &amp; <strong>modulation_data.xlsx</strong></span>
-                <span>🔄 Update Cadence: 5 Seconds</span>
-                <span>🔌 Interface Link: RS-232 Serial Port</span>
+            <div class="metadata-line">
+                <span>STORAGE SYSTEM: <strong>data.log</strong> &amp; <strong>modulation_data.xlsx</strong></span>
+                <span>DATA RATE: <strong>9600 bps (8N1)</strong></span>
+                <span>BUS TIMEOUT: <strong>5000 ms</strong></span>
             </div>
         </div>
     </div>
@@ -588,70 +652,121 @@ DASHBOARD_HTML = """
         let autoRefresh = true;
         let refreshInterval;
         let countdownInterval;
+        const SEGMENT_COUNT = 40; // High-density resolution meter segments
 
-        function parseModulationValue(value) {
-            if (value === "No Data" || !value) return 0;
-            const match = value.match(/(\d+(?:\.\d+)?)/);
-            if (match) {
-                let num = parseFloat(match[1]);
-                return Math.min(Math.max(num, 0), 150);
+        // Generate Hardware-Style LED segments programmatically
+        function structuralBuildLeds() {
+            const targets = ['stripDA', 'stripDB', 'stripDN'];
+            targets.forEach(id => {
+                const container = document.getElementById(id);
+                if (!container) return;
+                container.innerHTML = '';
+                for (let i = 0; i < SEGMENT_COUNT; i++) {
+                    const seg = document.createElement('div');
+                    seg.className = 'led-segment';
+                    container.appendChild(seg);
+                }
+            });
+        }
+
+        function extractNumericVolume(valStr) {
+            if (!valStr || valStr.includes("No Data") || valStr.includes("Error")) return null;
+            const outMatch = valStr.match(/(-?\d+(?:\.\d+)?)/);
+            return outMatch ? parseFloat(outMatch[1]) : null;
+        }
+
+        // Render standard color-coded broadcast segments (Green -> Orange -> Crimson)
+        function driveHardwareMeter(stripId, percentageValue, warnThreshold, critThreshold) {
+            const strip = document.getElementById(stripId);
+            if (!strip) return;
+            const segments = strip.getElementsByClassName('led-segment');
+            const activeCount = Math.round((Math.min(Math.max(percentageValue, 0), 150) / 150) * SEGMENT_COUNT);
+
+            for (let i = 0; i < SEGMENT_COUNT; i++) {
+                if (i < activeCount) {
+                    const currentPct = (i / SEGMENT_COUNT) * 150;
+                    if (currentPct >= critThreshold) {
+                        segments[i].style.backgroundColor = 'var(--signal-crit)';
+                        segments[i].style.boxShadow = '0 0 6px var(--signal-crit)';
+                    } else if (currentPct >= warnThreshold) {
+                        segments[i].style.backgroundColor = 'var(--signal-warn)';
+                        segments[i].style.boxShadow = '0 0 4px var(--signal-warn)';
+                    } else {
+                        segments[i].style.backgroundColor = 'var(--signal-ok)';
+                        segments[i].style.boxShadow = 'none';
+                    }
+                } else {
+                    segments[i].style.backgroundColor = 'var(--led-off)';
+                    segments[i].style.boxShadow = 'none';
+                }
             }
-            return 0;
         }
 
-        function updateModulationBars() {
-            const daValue = document.getElementById('valueDA').innerText;
-            const dbValue = document.getElementById('valueDB').innerText;
-            const dnValue = document.getElementById('valueDN').innerText;
+        function evaluateInstrumentCompliance() {
+            // Processing Instrument DA (Negative Peak)
+            const daVal = extractNumericVolume(document.getElementById('valueDA').innerText);
+            const cardDA = document.getElementById('cardDA');
+            if (daVal !== null) {
+                driveHardwareMeter('stripDA', daVal, 85, 99); // Critical danger at 100% negative (carrier cut)
+                cardDA.className = 'telemetry-card' + (daVal >= 99 ? ' alert-flash' : daVal >= 85 ? ' warn-state' : '');
+            }
 
-            const daPercent = (parseModulationValue(daValue) / 150) * 100;
-            const dbPercent = (parseModulationValue(dbValue) / 150) * 100;
-            const dnPercent = (parseModulationValue(dnValue) / 125) * 100;
+            // Processing Instrument DB (Positive Peak)
+            const dbVal = extractNumericVolume(document.getElementById('valueDB').innerText);
+            const cardDB = document.getElementById('cardDB');
+            if (dbVal !== null) {
+                driveHardwareMeter('stripDB', dbVal, 100, 125); // Asymmetrical peaks headroom standard
+                cardDB.className = 'telemetry-card' + (dbVal >= 125 ? ' alert-flash' : dbVal >= 100 ? ' warn-state' : '');
+            }
 
-            document.getElementById('barDA').style.width = daPercent + '%';
-            document.getElementById('barDB').style.width = dbPercent + '%';
-            document.getElementById('barDN').style.width = dnPercent + '%';
-        }
+            // Processing Instrument DH (Noise Floor evaluation in Decibels)
+            const dhVal = extractNumericVolume(document.getElementById('valueDH').innerText);
+            const cardDH = document.getElementById('cardDH');
+            if (dhVal !== null) {
+                // For decibels, values closer to 0 (e.g. -40dB) represent higher noise than -60dB.
+                cardDH.className = 'telemetry-card no-meter' + (dhVal >= -45 ? ' alert-flash' : dhVal >= -50 ? ' warn-state' : '');
+                document.getElementById('valueDH').style.color = dhVal >= -45 ? 'var(--signal-crit)' : dhVal >= -50 ? 'var(--signal-warn)' : 'var(--signal-ok)';
+            }
 
-        function addValueAnimation(elementId) {
-            const element = document.getElementById(elementId);
-            if (element) {
-                element.classList.add('value-updating');
-                setTimeout(() => {
-                    element.classList.remove('value-updating');
-                }, 400);
+            // Processing Instrument DN (RMS Audio Tracking)
+            const dnVal = extractNumericVolume(document.getElementById('valueDN').innerText);
+            const cardDN = document.getElementById('cardDN');
+            if (dnVal !== null) {
+                // Adjusting scale calculation matrix to target 125% volume mapping reference
+                const normalizedDN = (dnVal / 125) * 150;
+                driveHardwareMeter('stripDN', normalizedDN, 85, 110);
+                cardDN.className = 'telemetry-card' + (dnVal >= 110 ? ' alert-flash' : dnVal >= 85 ? ' warn-state' : '');
             }
         }
 
         function updateDashboard() {
             fetch('/api/telemetry')
-                .then(response => response.json())
+                .then(res => res.json())
                 .then(data => {
+                    document.getElementById('sysPulse').style.backgroundColor = 'var(--signal-ok)';
+                    document.getElementById('sysPulse').style.boxShadow = '0 0 8px var(--signal-ok)';
+                    document.getElementById('sysStatusText').innerText = "CONSOLE STREAMING ACTIVE";
+
                     const metrics = ['DA', 'DB', 'DG', 'DH', 'DN'];
-                    metrics.forEach(metric => {
-                        const oldValue = document.getElementById(`value${metric}`).innerText;
-                        const newValue = data[metric] || "No Data";
-                        if (oldValue !== newValue) {
-                            addValueAnimation(`value${metric}`);
+                    metrics.forEach(m => {
+                        const cell = document.getElementById(`value${m}`);
+                        const incoming = data[m] || "No Data";
+                        if (cell.innerText !== incoming) {
+                            cell.innerText = incoming;
+                            const card = document.getElementById(`card${m}`);
+                            card.classList.add('data-pulse');
+                            setTimeout(() => card.classList.remove('data-pulse'), 300);
                         }
-                        document.getElementById(`value${metric}`).innerText = newValue;
                     });
 
-                    const oldTimestamp = document.getElementById('lastUpdated').innerText;
-                    const newTimestamp = data.last_updated || "Never";
-                    if (oldTimestamp !== newTimestamp) {
-                        addValueAnimation('lastUpdated');
-                    }
-                    document.getElementById('lastUpdated').innerText = newTimestamp;
-
-                    updateModulationBars();
+                    document.getElementById('lastUpdated').innerText = data.last_updated || "Never";
+                    evaluateInstrumentCompliance();
                 })
-                .catch(error => {
-                    console.error('Error fetching telemetry:', error);
-                    document.querySelectorAll('.metric-value').forEach(el => {
-                        if (el.innerText === "No Data") return;
-                        el.style.opacity = '0.6';
-                    });
+                .catch(err => {
+                    console.error('Bus Downlink Exception:', err);
+                    document.getElementById('sysPulse').style.backgroundColor = 'var(--signal-crit)';
+                    document.getElementById('sysPulse').style.boxShadow = '0 0 8px var(--signal-crit)';
+                    document.getElementById('sysStatusText').innerText = "LINK TIMEOUT / HARDWARE FAULT";
                 });
         }
 
@@ -659,58 +774,52 @@ DASHBOARD_HTML = """
             if (refreshInterval) clearInterval(refreshInterval);
             if (countdownInterval) clearInterval(countdownInterval);
 
-            let seconds = 5;
-            const refreshCounter = document.getElementById('refreshCounter');
-            if (refreshCounter) refreshCounter.innerText = seconds;
+            let sec = 5;
+            const counter = document.getElementById('refreshCounter');
+            if (counter) counter.innerText = sec;
 
             refreshInterval = setInterval(() => {
                 if (autoRefresh) {
                     updateDashboard();
-                    seconds = 5;
-                    if (refreshCounter) refreshCounter.innerText = seconds;
+                    sec = 5;
+                    if (counter) counter.innerText = sec;
                 }
             }, 5000);
 
             countdownInterval = setInterval(() => {
                 if (autoRefresh) {
-                    seconds--;
-                    if (refreshCounter && seconds >= 0) {
-                        refreshCounter.innerText = seconds;
-                    }
-                    if (seconds < 0) seconds = 4;
+                    sec--;
+                    if (counter && sec >= 0) counter.innerText = sec;
+                    if (sec < 0) sec = 4;
                 }
             }, 1000);
         }
 
         function toggleAutoRefresh() {
             autoRefresh = !autoRefresh;
-            const toggleBtn = document.querySelector('.auto-refresh-toggle');
-            const refreshSpan = document.getElementById('refreshCounter');
-
+            const btn = document.querySelector('.refresh-btn');
             if (autoRefresh) {
-                toggleBtn.innerHTML = '⏸️ Pause Stream';
-                toggleBtn.style.background = '#0f2c59';
-                if (refreshSpan) refreshSpan.style.opacity = '1';
+                btn.innerHTML = '⏸ PAUSE BUS';
+                btn.style.background = '#1f2937';
                 updateDashboard();
                 startAutoRefresh();
             } else {
-                toggleBtn.innerHTML = '▶️ Resume Stream';
-                toggleBtn.style.background = '#10b981';
-                if (refreshSpan) refreshSpan.style.opacity = '0.5';
+                btn.innerHTML = '▶ RESUME BUS';
+                btn.style.background = 'var(--twr-navy)';
                 if (refreshInterval) clearInterval(refreshInterval);
                 if (countdownInterval) clearInterval(countdownInterval);
             }
         }
 
         window.addEventListener('load', () => {
-            updateModulationBars();
+            structuralBuildLeds();
+            evaluateInstrumentCompliance();
             startAutoRefresh();
         });
     </script>
 </body>
 </html>
 """
-
 
 @app.route('/')
 def index():
