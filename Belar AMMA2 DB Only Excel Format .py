@@ -35,11 +35,12 @@ app = Flask(__name__)
 
 # Global cache to share live telemetry between the serial background thread and Flask
 live_telemetry = {
-    "DA": "No Data",  # Negative Peak
-    "DB": "No Data",  # Positive Peak
-    "DG": "No Data",  # Carrier Reference
-    "DH": "No Data",  # AM Noise / Residual
-    "DN": "No Data",  # Average / RMS Modulation
+    # Meanings below are from the AMMA-2 manual, section 7 (ASCII RS-232 commands):
+    "DA": "No Data",  # Pos Peak Max      (0-150 %)  <- the positive modulation peak
+    "DB": "No Data",  # Pos Peak Ave      (0-150 %)
+    "DG": "No Data",  # Neg Peak Max      (0-100 %)  <- the negative modulation peak
+    "DH": "No Data",  # Neg Peak Ave      (0-100 %)
+    "DN": "No Data",  # Carrier Reference (0-200 %)
     "last_updated": "Never"
 }
 
@@ -67,8 +68,12 @@ def get_serial_device(device_file, baudrate=9600):
 
 
 def init_excel_workbook():
-    """Create or verify an Excel workbook matching the AMMA-2 DB export format."""
-    headers = ["Timestamp", "Positive Peak (DB)"]
+    """Create or verify the Excel log: Timestamp and Positive Peak (DA) only.
+
+    Per the AMMA-2 manual, DA = Pos Peak Max. (DB is only the positive peak AVERAGE,
+    which is why older logs labelled "Positive Peak (DB)" read lower.)
+    """
+    headers = ["Timestamp", "Positive Peak (DA)"]
 
     try:
         if os.path.exists(EXCEL_FILE):
@@ -77,14 +82,19 @@ def init_excel_workbook():
                 wb = openpyxl.load_workbook(EXCEL_FILE)
                 ws = wb.active
 
-                existing_headers = [ws.cell(row=1, column=i).value for i in range(1, 3)]
+                existing_headers = [c.value for c in ws[1] if c.value is not None]
                 if existing_headers != headers:
-                    # Rebuild the sheet so the workbook uses the requested two-column format.
-                    ws.delete_rows(1, ws.max_row)
+                    # Old layout: keep the old file untouched under a new name and start a
+                    # fresh log, instead of deleting the recorded readings.
+                    wb.close()
+                    backup = EXCEL_FILE.replace(
+                        ".xlsx", "_old_layout_" + time.strftime("%Y%m%d_%H%M%S") + ".xlsx")
+                    os.replace(EXCEL_FILE, backup)
+                    print(f"Existing log used an older layout; kept as {backup}")
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Telemetry Logs"
                     ws.append(headers)
-                # Remove any extra columns from the old six-column layout.
-                if ws.max_column > 2:
-                    ws.delete_cols(3, ws.max_column - 2)
         else:
             wb = openpyxl.Workbook()
             ws = wb.active
@@ -107,7 +117,7 @@ def init_excel_workbook():
 
         wb.save(EXCEL_FILE)
         wb.close()
-        print(f"Initialized AMMA-2 DB-only Excel workbook at: {EXCEL_FILE}")
+        print(f"Initialized AMMA-2 Excel workbook at: {EXCEL_FILE}")
     except Exception as e:
         logging.error("Failed to initialize Excel workbook: %s", e)
 
@@ -118,8 +128,8 @@ excel_queue = queue.Queue()
 
 
 def append_to_excel(timestamp, data_dict):
-    """Queue a Timestamp + Positive Peak (DB) row; the writer thread saves it."""
-    excel_queue.put([timestamp, data_dict.get("DB", "No Data")])
+    """Queue a Timestamp + Positive Peak (DA) row for the writer thread."""
+    excel_queue.put([timestamp, data_dict.get("DA", "No Data")])
 
 
 def excel_writer_worker():
@@ -150,7 +160,7 @@ def excel_writer_worker():
                 wb.save(EXCEL_FILE)
                 wb.close()
         except Exception as e:
-            logging.error("Failed writing DB dataset row entry to Excel file: %s", e)
+            logging.error("Failed writing dataset row entry to Excel file: %s", e)
             for row_data in rows:           # keep the data and retry on next pass
                 excel_queue.put(row_data)
             time.sleep(5)
@@ -307,6 +317,44 @@ def _numeric_value(value):
     return float(match.group()) if match else None
 
 
+# Instrument ranges from the AMMA-2 manual (section 7, "Unit Data Definitions").
+POSITIVE_MAX_PERCENT = 150.0   # DA / DB : Pos Peak Max / Ave, 0-150 %
+NEGATIVE_MAX_PERCENT = 100.0   # DG / DH : Neg Peak Max / Ave, 0-100 %
+# Which reading each loaded series is (as named in its source file's header) and how many
+# readings fell outside the instrument's range and were excluded.
+series_info = {
+    "amma": {"quantity": None, "dropped": 0},
+    "grms": {"quantity": None, "dropped": 0},
+}
+
+
+def _quantity_of(header):
+    """Return 'DA', 'DB', 'DG' or 'DH' if the column header names that command, else None."""
+    text = str(header or "")
+    for code in ("DA", "DB", "DG", "DH"):
+        if re.search(r"(?<![A-Za-z0-9])" + code + r"(?![A-Za-z0-9])", text, re.I):
+            return code
+    return None
+
+
+def _check_range(value, quantity, info):
+    """Return None (and count it) if a reading is outside what the AMMA-2 can report.
+
+    Out-of-range values (e.g. a stray 249 on DA, whose maximum is 150) are glitches such as
+    a transmitter dropout. They are excluded rather than clipped, so no data is invented.
+    """
+    if quantity in ("DA", "DB"):
+        limit = POSITIVE_MAX_PERCENT
+    elif quantity in ("DG", "DH"):
+        limit = NEGATIVE_MAX_PERCENT
+    else:
+        return value
+    if value > limit:
+        info["dropped"] += 1
+        return None
+    return value
+
+
 def _find_header(headers, candidates):
     """Find a column header using case/spacing/punctuation-insensitive matching."""
     normalized = {
@@ -383,15 +431,19 @@ def _read_amma_upload_rows():
             timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
             positive_col = _find_header(
                 headers,
-                ["Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DB", "Positive Peak"]
+                ["Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DA", "DB", "Positive Peak"]
             )
             if not timestamp_col or not positive_col:
                 return []
 
+            qty = _quantity_of(positive_col)
+            series_info["amma"] = {"quantity": qty, "dropped": 0}
             rows = []
             for item in reader:
                 ts = _parse_timestamp(item.get(timestamp_col))
                 value = _numeric_value(item.get(positive_col))
+                if value is not None:
+                    value = _check_range(value, qty, series_info["amma"])
                 if ts and value is not None:
                     rows.append({
                         "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -429,12 +481,15 @@ def read_amma_history(hours=24):
             timestamp_col = _find_header(headers, ["Timestamp"])
             positive_col = _find_header(
                 headers,
-                ["Positive Peak (DB)", "Positive Modulation", "DB", "Positive Peak"]
+                ["Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "DA", "DB", "Positive Peak"]
             )
 
             if not timestamp_col or not positive_col:
                 wb.close()
                 return []
+
+            hist_qty = _quantity_of(positive_col)
+            series_info["amma"] = {"quantity": hist_qty, "dropped": 0}
 
             ts_idx = headers.index(timestamp_col)
             pos_idx = headers.index(positive_col)
@@ -442,6 +497,8 @@ def read_amma_history(hours=24):
             for row in ws.iter_rows(min_row=2, values_only=True):
                 ts = _parse_timestamp(row[ts_idx] if ts_idx < len(row) else None)
                 value = _numeric_value(row[pos_idx] if pos_idx < len(row) else None)
+                if value is not None:
+                    value = _check_range(value, hist_qty, series_info["amma"])
                 if ts and value is not None and ts >= cutoff:
                     rows.append({
                         "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -466,13 +523,15 @@ def _read_grms_rows():
             timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
             positive_col = _find_header(
                 headers,
-                ["Positive Modulation", "Positive Modulation (%)", "Positive", "Blue", "Positive Peak", "DB"],
+                ["Positive Peak (DA)", "Positive Modulation", "Positive Modulation (%)", "Positive", "Blue", "Positive Peak", "DA", "DB"],
             )
             if not timestamp_col or not positive_col:
                 logging.error("GRMS file is missing a timestamp or positive-modulation column.")
                 return []
 
             raw_rows = [(item.get(timestamp_col), item.get(positive_col)) for item in reader]
+            grms_qty = _quantity_of(positive_col)
+            series_info["grms"] = {"quantity": grms_qty, "dropped": 0}
 
         amma = _read_amma_upload_rows()
         default_date = _parse_timestamp(amma[0]["timestamp"]) if amma else None
@@ -480,6 +539,8 @@ def _read_grms_rows():
         for raw_ts, raw_value in raw_rows:
             ts = _parse_timestamp(raw_ts, default_date=default_date)
             value = _numeric_value(raw_value)
+            if value is not None:
+                value = _check_range(value, grms_qty, series_info["grms"])
             if ts and value is not None:
                 parsed.append((ts, value))
 
@@ -522,7 +583,7 @@ def _save_grms_upload(file_storage):
         timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
         positive_col = _find_header(
             headers,
-            ["Positive Modulation", "Positive Modulation (%)", "Positive", "Blue", "Positive Peak", "DB"],
+            ["Positive Peak (DA)", "Positive Modulation", "Positive Modulation (%)", "Positive", "Blue", "Positive Peak", "DA", "DB"],
         )
         if not timestamp_col or not positive_col:
             raise ValueError(
@@ -549,7 +610,7 @@ def _save_grms_upload(file_storage):
         timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
         positive_col = _find_header(
             headers,
-            ["Positive Modulation", "Positive Modulation (%)", "Positive", "Blue", "Positive Peak", "DB"],
+            ["Positive Peak (DA)", "Positive Modulation", "Positive Modulation (%)", "Positive", "Blue", "Positive Peak", "DA", "DB"],
         )
         if not timestamp_col or not positive_col:
             raise ValueError(
@@ -575,10 +636,11 @@ def _save_grms_upload(file_storage):
         raise ValueError("No usable timestamp/positive-modulation rows were found.")
 
     normalized.sort(key=lambda item: item[0])
+    grms_qty = _quantity_of(positive_col)   # keep DA as DA, DB as DB - never swapped
 
     with open(GRMS_FILE, "w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["Timestamp", "Positive Modulation"])
+        writer.writerow(["Timestamp", "Positive Modulation" + (f" ({grms_qty})" if grms_qty else "")])
         for ts, value in normalized:
             # _parse_timestamp returns year 1900 for time-only strings.
             fmt = "%H:%M:%S" if ts.year == 1900 else "%Y-%m-%d %H:%M:%S"
@@ -603,10 +665,10 @@ def _save_amma_upload(file_storage):
         headers = [str(v) if v is not None else "" for v in values[0]]
         timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
         positive_col = _find_header(headers, [
-            "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DB", "Positive Peak"
+            "Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DA", "DB", "Positive Peak"
         ])
         if not timestamp_col or not positive_col:
-            raise ValueError("Could not find the AMMA-2 Timestamp and DB Positive Modulation columns.")
+            raise ValueError("Could not find the AMMA-2 Timestamp and Positive Peak (DA) columns.")
         ti, pi = headers.index(timestamp_col), headers.index(positive_col)
         raw_rows = [(row[ti] if ti < len(row) else None, row[pi] if pi < len(row) else None) for row in values[1:]]
     else:
@@ -619,10 +681,10 @@ def _save_amma_upload(file_storage):
         headers = reader.fieldnames or []
         timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
         positive_col = _find_header(headers, [
-            "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DB", "Positive Peak"
+            "Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DA", "DB", "Positive Peak"
         ])
         if not timestamp_col or not positive_col:
-            raise ValueError("Could not find the AMMA-2 Timestamp and DB Positive Modulation columns.")
+            raise ValueError("Could not find the AMMA-2 Timestamp and Positive Peak (DA) columns.")
         raw_rows = [(item.get(timestamp_col), item.get(positive_col)) for item in reader]
 
     normalized = []
@@ -633,12 +695,13 @@ def _save_amma_upload(file_storage):
             normalized.append((ts, value))
 
     if not normalized:
-        raise ValueError("No usable AMMA-2 timestamp/DB rows were found.")
+        raise ValueError("No usable AMMA-2 timestamp/Positive Peak (DA) rows were found.")
 
     normalized.sort(key=lambda x: x[0])
+    amma_qty = _quantity_of(positive_col)   # keep DA as DA, DB as DB - never swapped
     with open(AMMA_UPLOAD_FILE, "w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["Timestamp", "Positive Modulation"])
+        writer.writerow(["Timestamp", "Positive Modulation" + (f" ({amma_qty})" if amma_qty else "")])
         for ts, value in normalized:
             writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), value])
 
@@ -647,12 +710,12 @@ def _save_amma_upload(file_storage):
         for ts, value in normalized
     ])
     if not windowed:
-        raise ValueError("No usable AMMA-2 timestamp/DB rows were found.")
+        raise ValueError("No usable AMMA-2 timestamp/Positive Peak (DA) rows were found.")
     return len(windowed)
 
 
 def calculate_comparison(hours=24):
-    """Match AMMA DB readings to the nearest GRMS positive-modulation point."""
+    """Match AMMA-2 Positive Peak (DA) readings to the nearest GRMS positive-modulation point."""
     amma = read_comparison_amma()
     grms = _read_grms_rows()
 
@@ -1310,11 +1373,11 @@ DASHBOARD_HTML: str = """
         <!-- Operational Instruments Matrix Stack -->
         <div class="telemetry-grid">
 
-            <!-- INSTRUMENT 1: NEGATIVE PEAK (DA) -->
+            <!-- INSTRUMENT 1: POSITIVE PEAK MAX (DA) -->
             <div class="telemetry-card" id="cardDA">
                 <div class="metric-details">
-                    <div class="metric-tag">NEGATIVE PEAK MODULATION <span>DA</span></div>
-                    <div class="metric-desc">Carrier dropout evaluation (Limit: 100% standard envelope safety)</div>
+                    <div class="metric-tag">POSITIVE PEAK MODULATION (MAX) <span>DA</span></div>
+                    <div class="metric-desc">Pos Peak Max &mdash; instrument range 0&ndash;150% (125% marks the usual limit)</div>
                 </div>
                 <div class="meter-wrapper">
                     <div class="led-strip" id="stripDA"></div>
@@ -1327,65 +1390,62 @@ DASHBOARD_HTML: str = """
                 </div>
             </div>
 
-            <!-- INSTRUMENT 2: POSITIVE PEAK (DB) -->
-            <div class="telemetry-card" id="cardDB">
+            <!-- INSTRUMENT 2: POSITIVE PEAK AVERAGE (DB) -->
+            <div class="telemetry-card no-meter" id="cardDB">
                 <div class="metric-details">
-                    <div class="metric-tag">POSITIVE PEAK MODULATION <span>DB</span></div>
-                    <div class="metric-desc">Asymmetric envelope modulation crest factor (Max allocation: 125%)</div>
+                    <div class="metric-tag">POSITIVE PEAK AVERAGE <span>DB</span></div>
+                    <div class="metric-desc">Pos Peak Ave &mdash; average of the positive peaks (not the peak maximum)</div>
                 </div>
                 <div class="meter-wrapper">
-                    <div class="led-strip" id="stripDB"></div>
-                    <div class="scale-labels">
-                        <span>0%</span><span>20</span><span>40</span><span>60</span><span>80</span><span>100%</span><span>120</span><span>140%</span>
-                    </div>
+                    <div>[ Average of positive peaks - 0&ndash;150% ]</div>
                 </div>
                 <div class="readout-container">
                     <div class="digital-readout" id="valueDB">{{ telemetry.DB }}</div>
                 </div>
             </div>
 
-            <!-- INSTRUMENT 3: CARRIER REFERENCE (DG) -->
-            <div class="telemetry-card no-meter" id="cardDG">
+            <!-- INSTRUMENT 3: NEGATIVE PEAK MAX (DG) -->
+            <div class="telemetry-card" id="cardDG">
                 <div class="metric-details">
-                    <div class="metric-tag">UNMODULATED CARRIER REFERENCE <span>DG</span></div>
-                    <div class="metric-desc">RF power engine normalization calibration level</div>
+                    <div class="metric-tag">NEGATIVE PEAK MODULATION (MAX) <span>DG</span></div>
+                    <div class="metric-desc">Neg Peak Max &mdash; instrument range 0&ndash;100% (100% = carrier cut-off)</div>
                 </div>
                 <div class="meter-wrapper">
-                    <div>[ Dynamic Linear Reference Signal - Static Variable Tracking ]</div>
+                    <div class="led-strip" id="stripDG"></div>
+                    <div class="scale-labels">
+                        <span>0%</span><span>20</span><span>40</span><span>60</span><span>80</span><span>100%</span><span>120</span><span>140%</span>
+                    </div>
                 </div>
                 <div class="readout-container">
-                    <div class="digital-readout" id="valueDG" style="color: #38bdf8;">{{ telemetry.DG }}</div>
+                    <div class="digital-readout" id="valueDG">{{ telemetry.DG }}</div>
                 </div>
             </div>
 
-            <!-- INSTRUMENT 4: AM NOISE FLOOR (DH) -->
+            <!-- INSTRUMENT 4: NEGATIVE PEAK AVERAGE (DH) -->
             <div class="telemetry-card no-meter" id="cardDH">
                 <div class="metric-details">
-                    <div class="metric-tag">RESIDUAL AM NOISE FLOOR <span>DH</span></div>
-                    <div class="metric-desc">Integrated thermal noise &amp; residual interference (Target &lt; -50dB)</div>
+                    <div class="metric-tag">NEGATIVE PEAK AVERAGE <span>DH</span></div>
+                    <div class="metric-desc">Neg Peak Ave &mdash; average of the negative peaks, 0&ndash;100%</div>
                 </div>
                 <div class="meter-wrapper">
-                    <div>[ Spectrum Isolation Subsystem - Decibel Logarithmic Value ]</div>
+                    <div>[ Average of negative peaks - 0&ndash;100% ]</div>
                 </div>
                 <div class="readout-container">
                     <div class="digital-readout" id="valueDH">{{ telemetry.DH }}</div>
                 </div>
             </div>
 
-            <!-- INSTRUMENT 5: RMS MODULATION (DN) -->
-            <div class="telemetry-card" id="cardDN">
+            <!-- INSTRUMENT 5: CARRIER REFERENCE (DN) -->
+            <div class="telemetry-card no-meter" id="cardDN">
                 <div class="metric-details">
-                    <div class="metric-tag">AVERAGE RMS MODULATION DEPTH <span>DN</span></div>
-                    <div class="metric-desc">Integrated root-mean-square continuous audio energy levels</div>
+                    <div class="metric-tag">CARRIER REFERENCE <span>DN</span></div>
+                    <div class="metric-desc">Carrier level the AMMA-2 is using to calculate modulation (0&ndash;200%)</div>
                 </div>
                 <div class="meter-wrapper">
-                    <div class="led-strip" id="stripDN"></div>
-                    <div class="scale-labels">
-                        <span>0%</span><span>20</span><span>40</span><span>60</span><span>80</span><span>100%</span><span>120%</span>
-                    </div>
+                    <div>[ Reference level for the modulation readings ]</div>
                 </div>
                 <div class="readout-container">
-                    <div class="digital-readout" id="valueDN">{{ telemetry.DN }}</div>
+                    <div class="digital-readout" id="valueDN" style="color: #38bdf8;">{{ telemetry.DN }}</div>
                 </div>
             </div>
 
@@ -1397,7 +1457,7 @@ DASHBOARD_HTML: str = """
             <div class="history-header">
                 <div>
                     <h2>Positive Modulation History &amp; GRMS Comparison</h2>
-                    <p>Upload the real AMMA-2 broadcast data and GRMS export to compare Positive Modulation (DB) over the same broadcast window.</p>
+                    <p>Upload the real AMMA-2 broadcast data and GRMS export to compare Positive Peak Modulation (DA) over the same broadcast window.</p>
                 </div>
                 <div class="history-controls">
                     <label>Broadcast window</label>
@@ -1455,8 +1515,8 @@ DASHBOARD_HTML: str = """
             <div class="series-summary" id="seriesSummary"></div>
 
             <div class="chart-legend">
-                <span><i class="legend-dot amma-dot"></i> AMMA-2 Positive Modulation (DB) — blue</span>
-                <span><i class="legend-dot grms-dot"></i> GRMS Positive Modulation — red</span>
+                <span><i class="legend-dot amma-dot"></i> <span id="legendAmma">AMMA-2 Positive Peak Max (DA)</span> — blue</span>
+                <span><i class="legend-dot grms-dot"></i> <span id="legendGrms">GRMS Positive Modulation</span> — red</span>
             </div>
 
             <div class="grms-help">
@@ -1487,7 +1547,7 @@ DASHBOARD_HTML: str = """
 
         // Generate Hardware-Style LED segments programmatically
         function structuralBuildLeds() {
-            const targets = ['stripDA', 'stripDB', 'stripDN'];
+            const targets = ['stripDA', 'stripDG'];
             targets.forEach(id => {
                 const container = document.getElementById(id);
                 if (!container) return;
@@ -1534,39 +1594,20 @@ DASHBOARD_HTML: str = """
         }
 
         function evaluateInstrumentCompliance() {
-            // Processing Instrument DA (Negative Peak)
+            // DA = Pos Peak Max (0-150 %); 125 % is the usual positive limit.
             const daVal = extractNumericVolume(document.getElementById('valueDA').innerText);
             const cardDA = document.getElementById('cardDA');
             if (daVal !== null) {
-                driveHardwareMeter('stripDA', daVal, 85, 99); // Critical danger at 100% negative (carrier cut)
-                cardDA.className = 'telemetry-card' + (daVal >= 99 ? ' alert-flash' : daVal >= 85 ? ' warn-state' : '');
+                driveHardwareMeter('stripDA', daVal, 100, 125);
+                cardDA.className = 'telemetry-card' + (daVal >= 125 ? ' alert-flash' : daVal >= 100 ? ' warn-state' : '');
             }
 
-            // Processing Instrument DB (Positive Peak)
-            const dbVal = extractNumericVolume(document.getElementById('valueDB').innerText);
-            const cardDB = document.getElementById('cardDB');
-            if (dbVal !== null) {
-                driveHardwareMeter('stripDB', dbVal, 100, 125); // Asymmetrical peaks headroom standard
-                cardDB.className = 'telemetry-card' + (dbVal >= 125 ? ' alert-flash' : dbVal >= 100 ? ' warn-state' : '');
-            }
-
-            // Processing Instrument DH (Noise Floor evaluation in Decibels)
-            const dhVal = extractNumericVolume(document.getElementById('valueDH').innerText);
-            const cardDH = document.getElementById('cardDH');
-            if (dhVal !== null) {
-                // For decibels, values closer to 0 (e.g. -40dB) represent higher noise than -60dB.
-                cardDH.className = 'telemetry-card no-meter' + (dhVal >= -45 ? ' alert-flash' : dhVal >= -50 ? ' warn-state' : '');
-                document.getElementById('valueDH').style.color = dhVal >= -45 ? 'var(--signal-crit)' : dhVal >= -50 ? 'var(--signal-warn)' : 'var(--signal-ok)';
-            }
-
-            // Processing Instrument DN (RMS Audio Tracking)
-            const dnVal = extractNumericVolume(document.getElementById('valueDN').innerText);
-            const cardDN = document.getElementById('cardDN');
-            if (dnVal !== null) {
-                // Adjusting scale calculation matrix to target 125% volume mapping reference
-                const normalizedDN = (dnVal / 125) * 150;
-                driveHardwareMeter('stripDN', normalizedDN, 85, 110);
-                cardDN.className = 'telemetry-card' + (dnVal >= 110 ? ' alert-flash' : dnVal >= 85 ? ' warn-state' : '');
+            // DG = Neg Peak Max (0-100 %); 100 % means the carrier is being cut off.
+            const dgVal = extractNumericVolume(document.getElementById('valueDG').innerText);
+            const cardDG = document.getElementById('cardDG');
+            if (dgVal !== null) {
+                driveHardwareMeter('stripDG', dgVal, 85, 99);
+                cardDG.className = 'telemetry-card' + (dgVal >= 99 ? ' alert-flash' : dgVal >= 85 ? ' warn-state' : '');
             }
         }
 
@@ -1673,6 +1714,17 @@ DASHBOARD_HTML: str = """
         let chartState = null;
         let chartHoverX = null;
         let lastChartRows = { amma: [], grms: [] };
+
+        // Which reading (DA / DB) each series really is, as labelled in its source file.
+        let seriesInfo = { amma: { quantity: 'DA', dropped: 0 }, grms: { quantity: null, dropped: 0 } };
+        function seriesLabel(name, info, short) {
+            const q = info && info.quantity ? info.quantity : '';
+            if (short) return name + (q ? ' (' + q + ')' : '');
+            // Names per the AMMA-2 manual: DA/DB are positive readings, DG/DH are negative.
+            const what = { DA: 'Positive Peak Max', DB: 'Positive Peak Average',
+                           DG: 'Negative Peak Max', DH: 'Negative Peak Average' }[q] || 'Positive Modulation';
+            return name + ' ' + what + (q ? ' (' + q + ')' : '');
+        }
 
         function chartDate(value) {
             const d = new Date(value);
@@ -1783,8 +1835,8 @@ DASHBOARD_HTML: str = """
 
         function drawLegend(ctx, plot, amma, grms) {
             const items = [
-                { color: '#2563eb', text: 'AMMA-2 Positive Modulation (DB)  n=' + amma.length },
-                { color: '#dc2626', text: 'GRMS Positive Modulation  n=' + grms.length }
+                { color: '#2563eb', text: seriesLabel('AMMA-2', seriesInfo.amma) + '  n=' + amma.length },
+                { color: '#dc2626', text: seriesLabel('GRMS', seriesInfo.grms) + '  n=' + grms.length }
             ];
             ctx.save();
             ctx.font = '11px Segoe UI, Arial, sans-serif';
@@ -1956,8 +2008,8 @@ DASHBOARD_HTML: str = """
             if (!box) return;
             box.innerHTML = '';
             [
-                { name: 'AMMA-2 (DB)', cls: 'amma-dot', stats: summarizeSeries(amma) },
-                { name: 'GRMS', cls: 'grms-dot', stats: summarizeSeries(grms) }
+                { name: seriesLabel('AMMA-2', seriesInfo.amma, true), cls: 'amma-dot', stats: summarizeSeries(amma) },
+                { name: seriesLabel('GRMS', seriesInfo.grms, true), cls: 'grms-dot', stats: summarizeSeries(grms) }
             ].forEach(series => {
                 const item = document.createElement('div');
                 item.className = 'series-summary-item';
@@ -2052,14 +2104,32 @@ DASHBOARD_HTML: str = """
                         ? '—'
                         : comparison.correlation.toFixed(3);
 
+                if (comparison.series) seriesInfo = comparison.series;
+                document.getElementById('legendAmma').innerText = seriesLabel('AMMA-2', seriesInfo.amma);
+                document.getElementById('legendGrms').innerText = seriesLabel('GRMS', seriesInfo.grms);
                 drawModulationChart(history, grms);
 
                 const alignNote = document.getElementById('alignNote');
                 const al = comparison.alignment;
-                alignNote.innerText = (al && al.from)
-                    ? 'Note: the GRMS file is dated ' + al.from + ' and the AMMA-2 file ' + al.to +
-                      '. GRMS was moved to the AMMA-2 date so the same clock times line up.'
-                    : '';
+                const notes = [];
+                if (al && al.from) {
+                    notes.push('The GRMS file is dated ' + al.from + ' and the AMMA-2 file ' + al.to +
+                      '. GRMS was moved to the AMMA-2 date so the same clock times line up.');
+                }
+                ['amma', 'grms'].forEach(k => {
+                    const si = comparison.series && comparison.series[k];
+                    if (si && si.dropped) {
+                        notes.push(si.dropped + ' ' + (k === 'amma' ? 'AMMA-2' : 'GRMS') +
+                          ' reading(s) outside the AMMA-2 range were excluded as glitches.');
+                    }
+                });
+                if (comparison.quantity_mismatch) {
+                    notes.push('The two files are different readings (' +
+                      seriesLabel('AMMA-2', comparison.series.amma, true) + ' vs ' +
+                      seriesLabel('GRMS', comparison.series.grms, true) +
+                      '), so the statistics are not like-for-like.');
+                }
+                alignNote.innerText = notes.length ? 'Note: ' + notes.join(' ') : '';
 
                 const status = document.getElementById('uploadStatus');
                 if (grms.length) {
@@ -2212,12 +2282,15 @@ def api_comparison():
     hours = max(1, min(hours, 24 * 30))
     result = calculate_comparison(hours)
     result["alignment"] = dict(grms_alignment)
+    result["series"] = {k: dict(v) for k, v in series_info.items()}
+    aq, gq = series_info["amma"]["quantity"], series_info["grms"]["quantity"]
+    result["quantity_mismatch"] = bool(aq and gq and aq != gq)
     return jsonify(result)
 
 
 @app.route('/upload-amma', methods=['POST'])
 def upload_amma():
-    """Accept an AMMA-2 CSV/XLSX export containing Timestamp + DB Positive Modulation."""
+    """Accept an AMMA-2 CSV/XLSX export containing Timestamp + Positive Peak (DA)."""
     uploaded = request.files.get("file")
     if not uploaded or not uploaded.filename:
         return jsonify({"error": "No AMMA-2 file was selected."}), 400
@@ -2255,7 +2328,6 @@ def upload_grms():
         })
     except Exception as exc:
         logging.exception("GRMS upload failed")
-        return jsonify({"error": str(exc)}), )
         return jsonify({"error": str(exc)}), 400
 
 
