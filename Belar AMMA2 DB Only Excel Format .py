@@ -13,9 +13,10 @@ import csv
 import io
 import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from bisect import bisect_left
 from threading import Thread, Lock
+import queue
 import time
 from flask import Flask, jsonify, render_template_string, request
 import openpyxl
@@ -29,14 +30,13 @@ logging.basicConfig(
     format="%(asctime)s : %(message)s",
     datefmt="%Y-%m-%d %H:%M",
 )
-logging.Formatter.converter = time.gmtime  # data.log timestamps in UTC
 
 app = Flask(__name__)
 
 # Global cache to share live telemetry between the serial background thread and Flask
 live_telemetry = {
-    "DA": "No Data",  # Positive Peak
-    "DB": "No Data",  # Negative Peak
+    "DA": "No Data",  # Negative Peak
+    "DB": "No Data",  # Positive Peak
     "DG": "No Data",  # Carrier Reference
     "DH": "No Data",  # AM Noise / Residual
     "DN": "No Data",  # Average / RMS Modulation
@@ -46,9 +46,12 @@ live_telemetry = {
 EXCEL_FILE = "./modulation_data.xlsx"
 GRMS_FILE = "./grms_comparison.csv"
 AMMA_UPLOAD_FILE = "./amma2_comparison.csv"
-COMPARISON_START_TIME = "17:58:00"  # UTC
-COMPARISON_END_TIME = "20:50:00"    # UTC
+COMPARISON_START_TIME = "19:58:00"
+COMPARISON_END_TIME = "22:50:00"
 excel_lock = Lock()
+# Set by _read_grms_rows when the GRMS file had to be moved to the AMMA-2 date.
+grms_alignment = {"from": None, "to": None}
+POLL_INTERVAL = 10  # seconds between readings (fixed cadence)
 
 
 def get_serial_device(device_file, baudrate=9600):
@@ -64,22 +67,10 @@ def get_serial_device(device_file, baudrate=9600):
 
 
 def init_excel_workbook():
-    """Create or verify an Excel workbook matching the AMMA-2 DA (positive peak) export format."""
-    headers = ["Timestamp (UTC)", "Positive Peak (DA)"]
+    """Create or verify an Excel workbook matching the AMMA-2 DB export format."""
+    headers = ["Timestamp", "Positive Peak (DB)"]
 
     try:
-        # Older logs used local time and/or the DB channel. Keep them as a backup instead of
-        # mixing them with the new UTC / DA data.
-        if os.path.exists(EXCEL_FILE):
-            with excel_lock:
-                _wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True)
-                _hdr = [c.value for c in next(_wb.active.iter_rows(min_row=1, max_row=1))][:2]
-                _wb.close()
-            if _hdr != headers:
-                backup = EXCEL_FILE.replace(".xlsx", "_old_local_time.xlsx")
-                os.replace(EXCEL_FILE, backup)
-                print(f"Older (local-time / DB-column) log moved to: {backup}")
-
         if os.path.exists(EXCEL_FILE):
             # Keep existing workbook data if it already has the expected structure.
             with excel_lock:
@@ -116,126 +107,140 @@ def init_excel_workbook():
 
         wb.save(EXCEL_FILE)
         wb.close()
-        print(f"Initialized AMMA-2 DA-only Excel workbook at: {EXCEL_FILE}")
+        print(f"Initialized AMMA-2 DB-only Excel workbook at: {EXCEL_FILE}")
     except Exception as e:
         logging.error("Failed to initialize Excel workbook: %s", e)
 
+# Queue that decouples slow Excel disk writes from the serial polling loop.
+# The polling thread only does an instant put(); a separate writer thread does the
+# (slow, growing-with-file-size) load/append/save. This keeps the cadence exact.
+excel_queue = queue.Queue()
+
+
 def append_to_excel(timestamp, data_dict):
-    """Append only Timestamp and Positive Peak (DA) to the Excel log."""
-    try:
-        with excel_lock:
-            if not os.path.exists(EXCEL_FILE):
-                init_excel_workbook()
+    """Queue a Timestamp + Positive Peak (DB) row; the writer thread saves it."""
+    excel_queue.put([timestamp, data_dict.get("DB", "No Data")])
 
-            wb = openpyxl.load_workbook(EXCEL_FILE)
-            ws = wb.active
 
-            row_data = [timestamp, data_dict.get("DA", "No Data")]
-            ws.append(row_data)
+def excel_writer_worker():
+    """Drain the queue and append all pending rows to the workbook in one save."""
+    data_font = Font(name="Segoe UI", size=10)
+    center_align = Alignment(horizontal="center", vertical="center")
 
-            last_row = ws.max_row
-            data_font = Font(name="Segoe UI", size=10)
-            center_align = Alignment(horizontal="center", vertical="center")
-            for cell in ws[last_row]:
-                cell.font = data_font
-                cell.alignment = center_align
+    while True:
+        rows = [excel_queue.get()]          # block until at least one row arrives
+        while True:                         # grab anything else already waiting
+            try:
+                rows.append(excel_queue.get_nowait())
+            except queue.Empty:
+                break
 
-            ws.column_dimensions["A"].width = max(
-                22, max(len(str(cell.value or "")) for cell in ws["A"]) + 3
-            )
-            ws.column_dimensions["B"].width = max(
-                24, max(len(str(cell.value or "")) for cell in ws["B"]) + 3
-            )
+        try:
+            with excel_lock:
+                if not os.path.exists(EXCEL_FILE):
+                    init_excel_workbook()
 
-            wb.save(EXCEL_FILE)
-            wb.close()
-    except Exception as e:
-        logging.error("Failed writing DA dataset row entry to Excel file: %s", e)
+                wb = openpyxl.load_workbook(EXCEL_FILE)
+                ws = wb.active
+                for row_data in rows:
+                    ws.append(row_data)
+                    for cell in ws[ws.max_row]:
+                        cell.font = data_font
+                        cell.alignment = center_align
+                wb.save(EXCEL_FILE)
+                wb.close()
+        except Exception as e:
+            logging.error("Failed writing DB dataset row entry to Excel file: %s", e)
+            for row_data in rows:           # keep the data and retry on next pass
+                excel_queue.put(row_data)
+            time.sleep(5)
+
+
+def read_response(ser, max_wait=0.6):
+    """Read one reply, returning as soon as the terminator (CR or LF) arrives.
+
+    ser.readline() only stops on LF. If the AMMA-2 ends its replies with CR, it
+    sits waiting for the full 1 s serial timeout on every command (5 commands =
+    ~5 s of extra delay per cycle). This returns the moment a terminator is seen.
+    """
+    buf = bytearray()
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        chunk = ser.read(ser.in_waiting or 1)
+        if chunk:
+            buf.extend(chunk)
+            if b"\r" in buf or b"\n" in buf:
+                break
+    return buf.decode("ascii", errors="ignore").strip()
+
 
 def data_collection_worker():
-    """Poll the AMMA-2 every 10 seconds, using UTC timestamps."""
+    """Poll the AMMA-2 on a fixed, drift-free cadence of POLL_INTERVAL seconds."""
     global live_telemetry
     device = "/dev/ttyUSB0"
-    collection_interval = 10.0
 
+    # Initialize structural layout components for Excel spreadsheet tracking
     init_excel_workbook()
-    commands = ["DA\\r", "DB\\r", "DG\\r", "DH\\r", "DN\\r"]
+    Thread(target=excel_writer_worker, daemon=True).start()
+
+    commands = ["DA\r", "DB\r", "DG\r", "DH\r", "DN\r"]
     print("Starting background serial data collection thread...")
-    print("Collection interval: every 10 seconds (timestamps in UTC).")
 
     while True:
         try:
             print("Attempting connection to serial device...")
             with get_serial_device(device) as ser:
                 print("Connection established. Beginning collection loops...")
-
-                # Use a monotonic clock for interval timing. This prevents
-                # clock adjustments/NTP corrections from changing the cadence.
-                next_cycle = time.monotonic()
+                next_tick = time.monotonic()
+                wall_anchor = time.time()
+                tick_no = 0
 
                 while True:
-                    # Wait until the next scheduled collection start.
-                    wait_seconds = next_cycle - time.monotonic()
-                    if wait_seconds > 0:
-                        time.sleep(wait_seconds)
-
-                    print("Start collecting data ...")
+                    # Timestamp = scheduled tick time, so rows are exactly POLL_INTERVAL apart
+                    # no matter how long the serial reads or disk writes took.
+                    tick_wall = wall_anchor + tick_no * POLL_INTERVAL
+                    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(round(tick_wall)))
                     cycle_data = {}
 
                     for command in commands:
-                        clean_cmd = command.replace("\\r", "")
+                        clean_cmd = command.replace("\r", "")
                         try:
-                            ser.write(command.encode("ascii"))
-                            time.sleep(0.1)
-
-                            raw_data = ser.readline()
-                            data = raw_data.decode("ascii", errors="ignore").strip()
+                            ser.reset_input_buffer()          # drop stray CR/LF from last reply
+                            ser.write(command.encode('ascii'))
+                            data = read_response(ser)
 
                             logging.info(";Data for %s :; %s ", clean_cmd, data)
                             cycle_data[clean_cmd] = data if data else "No Data"
-
                             if data:
                                 live_telemetry[clean_cmd] = data
 
-                        except serial.SerialException as exc:
-                            logging.error(
-                                "Error reading from serial device during command %s: %s",
-                                clean_cmd, exc
-                            )
+                        except serial.SerialException as e:
+                            logging.error("Error reading from serial device during command %s: %s", clean_cmd, e)
                             cycle_data[clean_cmd] = "Error"
-                            raise
+                            raise  # break out and re-initialize the port
 
-                        time.sleep(0.1)
-
-                    # Store the collection timestamp in UTC.
-                    current_time = datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
                     live_telemetry["last_updated"] = current_time
-                    append_to_excel(current_time, cycle_data)
+                    append_to_excel(current_time, cycle_data)   # instant: just queues the row
 
-                    print(
-                        f"Collected data at {current_time} UTC. "
-                        "Next collection is scheduled 10 seconds after this cycle start."
-                    )
-
-                    # Schedule by start-to-start interval, avoiding cumulative
-                    # drift caused by adding a 10-second sleep after each cycle.
-                    next_cycle += collection_interval
-                    now = time.monotonic()
-                    if next_cycle <= now:
-                        # If serial communication takes longer than 10 seconds,
-                        # skip missed slots rather than taking rapid catch-up readings.
-                        missed = int((now - next_cycle) // collection_interval) + 1
-                        next_cycle += missed * collection_interval
+                    # Sleep only until the next scheduled tick (not a fixed 10 s on top of work time).
+                    tick_no += 1
+                    next_tick += POLL_INTERVAL
+                    delay = next_tick - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    else:
+                        # Cycle overran the interval: resync instead of bursting to catch up.
+                        logging.warning("Poll cycle overran %.1fs interval by %.2fs", POLL_INTERVAL, -delay)
+                        next_tick = time.monotonic()
+                        wall_anchor = time.time()
+                        tick_no = 0
 
         except (serial.SerialException, OSError) as init_error:
-            logging.error(
-                "Serial port connection dropped or missing: %s. Retrying in 10s...",
-                init_error
-            )
+            logging.error("Serial port connection dropped or missing: %s. Retrying in 10s...", init_error)
             print("Serial port dropped. Re-attempting pipeline in 10 seconds...")
             time.sleep(10)
+
+
 
 
 
@@ -323,7 +328,7 @@ def _find_header(headers, candidates):
 
 
 def _filter_comparison_window(rows):
-    """Keep one broadcast window: 17:58:00 through 20:50:00 UTC.
+    """Keep one broadcast window: 19:58:00 through 22:50:00.
 
     If full dates are present, the first date found is treated as the
     broadcast date so that unrelated days are not mixed into the graph.
@@ -347,14 +352,23 @@ def _filter_comparison_window(rows):
     # Use the first/earliest broadcast date when dates are supplied.
     broadcast_date = min(ts.date() for ts, _ in parsed)
     selected = []
+    same_day = []
     for ts, value in parsed:
-        if ts.date() == broadcast_date and start_t <= ts.time() <= end_t:
-            selected.append({
-                "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S"),
-                "value": value
-            })
-    selected.sort(key=lambda x: x["timestamp"])
-    return selected
+        if ts.date() != broadcast_date:
+            continue
+        point = {
+            "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S"),
+            "value": value
+        }
+        same_day.append(point)
+        if start_t <= ts.time() <= end_t:
+            selected.append(point)
+
+    # If nothing falls inside the broadcast window, don't reject the file:
+    # fall back to every reading on that date so any time of day can be uploaded.
+    result = selected if selected else same_day
+    result.sort(key=lambda x: x["timestamp"])
+    return result
 
 
 def _read_amma_upload_rows():
@@ -369,7 +383,7 @@ def _read_amma_upload_rows():
             timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
             positive_col = _find_header(
                 headers,
-                ["Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DA", "DB", "Positive Peak"]
+                ["Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DB", "Positive Peak"]
             )
             if not timestamp_col or not positive_col:
                 return []
@@ -400,11 +414,11 @@ def read_comparison_amma():
 
 
 def read_amma_history(hours=24):
-    """Read Timestamp + Positive Peak (DA) from the local AMMA Excel log."""
+    """Read Timestamp + Positive Peak (DB) from the local AMMA Excel log."""
     if not os.path.exists(EXCEL_FILE):
         return []
 
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=max(1, min(hours, 24 * 30)))
+    cutoff = datetime.now() - timedelta(hours=max(1, min(hours, 24 * 30)))
     rows = []
 
     try:
@@ -412,10 +426,10 @@ def read_amma_history(hours=24):
             wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True, data_only=True)
             ws = wb.active
             headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-            timestamp_col = _find_header(headers, ["Timestamp (UTC)", "Timestamp"])
+            timestamp_col = _find_header(headers, ["Timestamp"])
             positive_col = _find_header(
                 headers,
-                ["Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "DA", "DB", "Positive Peak"]
+                ["Positive Peak (DB)", "Positive Modulation", "DB", "Positive Peak"]
             )
 
             if not timestamp_col or not positive_col:
@@ -462,13 +476,28 @@ def _read_grms_rows():
 
         amma = _read_amma_upload_rows()
         default_date = _parse_timestamp(amma[0]["timestamp"]) if amma else None
-        rows = []
+        parsed = []
         for raw_ts, raw_value in raw_rows:
             ts = _parse_timestamp(raw_ts, default_date=default_date)
             value = _numeric_value(raw_value)
             if ts and value is not None:
-                rows.append({"timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S"), "value": value})
+                parsed.append((ts, value))
 
+        # The two files are often recorded on different days (e.g. AMMA-2 on 17 Nov,
+        # GRMS on 9 Nov). Slide the whole GRMS series by whole days so it lands on the
+        # AMMA-2 date; time-of-day is untouched, so readings line up on the same clock time.
+        grms_alignment["from"] = grms_alignment["to"] = None
+        if parsed and default_date is not None:
+            shift = default_date.date() - min(ts.date() for ts, _ in parsed)
+            if shift:
+                parsed = [(ts + shift, v) for ts, v in parsed]
+                grms_alignment["from"] = (default_date.date() - shift).isoformat()
+                grms_alignment["to"] = default_date.date().isoformat()
+
+        rows = [
+            {"timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S"), "value": value}
+            for ts, value in parsed
+        ]
         return _filter_comparison_window(rows)
     except Exception as exc:
         logging.error("Failed reading GRMS comparison file: %s", exc)
@@ -531,13 +560,13 @@ def _save_grms_upload(file_storage):
             for item in reader
         ]
 
-    # Align time-only GRMS exports to the first AMMA logging date.
-    amma = read_amma_history(24 * 30)
-    default_date = _parse_timestamp(amma[0]["timestamp"]) if amma else datetime.now(timezone.utc).replace(tzinfo=None)
-
+    # Time-only GRMS exports (e.g. "19:01:00") have no date. Do NOT guess a date here:
+    # the old code used today's date, which put GRMS on a different day from the AMMA-2
+    # data and made the two series impossible to compare. Time-only rows are saved as
+    # time-only, and _read_grms_rows() gives them the AMMA-2 file's date when reading.
     normalized = []
     for raw_ts, raw_value in raw_rows:
-        ts = _parse_timestamp(raw_ts, default_date=default_date)
+        ts = _parse_timestamp(raw_ts)
         value = _numeric_value(raw_value)
         if ts and value is not None:
             normalized.append((ts, value))
@@ -551,7 +580,9 @@ def _save_grms_upload(file_storage):
         writer = csv.writer(fh)
         writer.writerow(["Timestamp", "Positive Modulation"])
         for ts, value in normalized:
-            writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), value])
+            # _parse_timestamp returns year 1900 for time-only strings.
+            fmt = "%H:%M:%S" if ts.year == 1900 else "%Y-%m-%d %H:%M:%S"
+            writer.writerow([ts.strftime(fmt), value])
 
     return len(normalized)
 
@@ -572,10 +603,10 @@ def _save_amma_upload(file_storage):
         headers = [str(v) if v is not None else "" for v in values[0]]
         timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
         positive_col = _find_header(headers, [
-            "Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DA", "DB", "Positive Peak"
+            "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DB", "Positive Peak"
         ])
         if not timestamp_col or not positive_col:
-            raise ValueError("Could not find the AMMA-2 Timestamp and DA Positive Modulation columns.")
+            raise ValueError("Could not find the AMMA-2 Timestamp and DB Positive Modulation columns.")
         ti, pi = headers.index(timestamp_col), headers.index(positive_col)
         raw_rows = [(row[ti] if ti < len(row) else None, row[pi] if pi < len(row) else None) for row in values[1:]]
     else:
@@ -588,10 +619,10 @@ def _save_amma_upload(file_storage):
         headers = reader.fieldnames or []
         timestamp_col = _find_header(headers, ["Timestamp", "Date Time", "DateTime", "Time", "Date"])
         positive_col = _find_header(headers, [
-            "Positive Peak (DA)", "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DA", "DB", "Positive Peak"
+            "Positive Peak (DB)", "Positive Modulation", "Positive Modulation (%)", "DB", "Positive Peak"
         ])
         if not timestamp_col or not positive_col:
-            raise ValueError("Could not find the AMMA-2 Timestamp and DA Positive Modulation columns.")
+            raise ValueError("Could not find the AMMA-2 Timestamp and DB Positive Modulation columns.")
         raw_rows = [(item.get(timestamp_col), item.get(positive_col)) for item in reader]
 
     normalized = []
@@ -602,7 +633,7 @@ def _save_amma_upload(file_storage):
             normalized.append((ts, value))
 
     if not normalized:
-        raise ValueError("No usable AMMA-2 timestamp/DA rows were found.")
+        raise ValueError("No usable AMMA-2 timestamp/DB rows were found.")
 
     normalized.sort(key=lambda x: x[0])
     with open(AMMA_UPLOAD_FILE, "w", encoding="utf-8", newline="") as fh:
@@ -616,12 +647,12 @@ def _save_amma_upload(file_storage):
         for ts, value in normalized
     ])
     if not windowed:
-        raise ValueError("The AMMA-2 file contains no readings between 17:58:00 and 20:50:00 UTC.")
+        raise ValueError("No usable AMMA-2 timestamp/DB rows were found.")
     return len(windowed)
 
 
 def calculate_comparison(hours=24):
-    """Match AMMA DA readings to the nearest GRMS positive-modulation point."""
+    """Match AMMA DB readings to the nearest GRMS positive-modulation point."""
     amma = read_comparison_amma()
     grms = _read_grms_rows()
 
@@ -1271,7 +1302,7 @@ DASHBOARD_HTML: str = """
                 <span id="sysStatusText">CONSOLE STREAMING ACTIVE</span>
             </div>
             <div class="refresh-controls">
-                <span>DASHBOARD REFRESH: <strong id="refreshCounter" style="color: var(--text-main);">5</strong>s</span>
+                <span>CADENCE: <strong id="refreshCounter" style="color: var(--text-main);">5</strong>s</span>
                 <button class="refresh-btn" onclick="toggleAutoRefresh()">⏸ PAUSE BUS</button>
             </div>
         </div>
@@ -1279,11 +1310,11 @@ DASHBOARD_HTML: str = """
         <!-- Operational Instruments Matrix Stack -->
         <div class="telemetry-grid">
 
-            <!-- INSTRUMENT 1: POSITIVE PEAK (DA) -->
+            <!-- INSTRUMENT 1: NEGATIVE PEAK (DA) -->
             <div class="telemetry-card" id="cardDA">
                 <div class="metric-details">
-                    <div class="metric-tag">POSITIVE PEAK MODULATION <span>DA</span></div>
-                    <div class="metric-desc">Asymmetric envelope modulation crest factor (Max allocation: 125%)</div>
+                    <div class="metric-tag">NEGATIVE PEAK MODULATION <span>DA</span></div>
+                    <div class="metric-desc">Carrier dropout evaluation (Limit: 100% standard envelope safety)</div>
                 </div>
                 <div class="meter-wrapper">
                     <div class="led-strip" id="stripDA"></div>
@@ -1296,11 +1327,11 @@ DASHBOARD_HTML: str = """
                 </div>
             </div>
 
-            <!-- INSTRUMENT 2: NEGATIVE PEAK (DB) -->
+            <!-- INSTRUMENT 2: POSITIVE PEAK (DB) -->
             <div class="telemetry-card" id="cardDB">
                 <div class="metric-details">
-                    <div class="metric-tag">NEGATIVE PEAK MODULATION <span>DB</span></div>
-                    <div class="metric-desc">Carrier dropout evaluation (Limit: 100% standard envelope safety)</div>
+                    <div class="metric-tag">POSITIVE PEAK MODULATION <span>DB</span></div>
+                    <div class="metric-desc">Asymmetric envelope modulation crest factor (Max allocation: 125%)</div>
                 </div>
                 <div class="meter-wrapper">
                     <div class="led-strip" id="stripDB"></div>
@@ -1366,11 +1397,11 @@ DASHBOARD_HTML: str = """
             <div class="history-header">
                 <div>
                     <h2>Positive Modulation History &amp; GRMS Comparison</h2>
-                    <p>Upload the real AMMA-2 broadcast data and GRMS export to compare Positive Modulation (DA) over the same broadcast window.</p>
+                    <p>Upload the real AMMA-2 broadcast data and GRMS export to compare Positive Modulation (DB) over the same broadcast window.</p>
                 </div>
                 <div class="history-controls">
                     <label>Broadcast window</label>
-                    <strong style="color:var(--text-main);">17:58:00 → 20:50:00 UTC</strong>
+                    <strong style="color:var(--text-main);">19:58:00 → 22:50:00</strong>
                     <button class="refresh-btn" onclick="refreshHistory()">↻ REFRESH GRAPH</button>
                 </div>
             </div>
@@ -1419,10 +1450,12 @@ DASHBOARD_HTML: str = """
             </div>
             <div class="chart-note">Comparison window: {{ window_start }} → {{ window_end }} · hover the graph for exact readings</div>
 
+            <div class="chart-note" id="alignNote"></div>
+
             <div class="series-summary" id="seriesSummary"></div>
 
             <div class="chart-legend">
-                <span><i class="legend-dot amma-dot"></i> AMMA-2 Positive Modulation (DA) — blue</span>
+                <span><i class="legend-dot amma-dot"></i> AMMA-2 Positive Modulation (DB) — blue</span>
                 <span><i class="legend-dot grms-dot"></i> GRMS Positive Modulation — red</span>
             </div>
 
@@ -1501,20 +1534,20 @@ DASHBOARD_HTML: str = """
         }
 
         function evaluateInstrumentCompliance() {
-            // Processing Instrument DA (Positive Peak)
+            // Processing Instrument DA (Negative Peak)
             const daVal = extractNumericVolume(document.getElementById('valueDA').innerText);
             const cardDA = document.getElementById('cardDA');
             if (daVal !== null) {
-                driveHardwareMeter('stripDA', daVal, 100, 125); // Asymmetrical peaks headroom standard
-                cardDA.className = 'telemetry-card' + (daVal >= 125 ? ' alert-flash' : daVal >= 100 ? ' warn-state' : '');
+                driveHardwareMeter('stripDA', daVal, 85, 99); // Critical danger at 100% negative (carrier cut)
+                cardDA.className = 'telemetry-card' + (daVal >= 99 ? ' alert-flash' : daVal >= 85 ? ' warn-state' : '');
             }
 
-            // Processing Instrument DB (Negative Peak)
+            // Processing Instrument DB (Positive Peak)
             const dbVal = extractNumericVolume(document.getElementById('valueDB').innerText);
             const cardDB = document.getElementById('cardDB');
             if (dbVal !== null) {
-                driveHardwareMeter('stripDB', dbVal, 85, 99); // Critical danger at 100% negative (carrier cut)
-                cardDB.className = 'telemetry-card' + (dbVal >= 99 ? ' alert-flash' : dbVal >= 85 ? ' warn-state' : '');
+                driveHardwareMeter('stripDB', dbVal, 100, 125); // Asymmetrical peaks headroom standard
+                cardDB.className = 'telemetry-card' + (dbVal >= 125 ? ' alert-flash' : dbVal >= 100 ? ' warn-state' : '');
             }
 
             // Processing Instrument DH (Noise Floor evaluation in Decibels)
@@ -1750,7 +1783,7 @@ DASHBOARD_HTML: str = """
 
         function drawLegend(ctx, plot, amma, grms) {
             const items = [
-                { color: '#2563eb', text: 'AMMA-2 Positive Modulation (DA)  n=' + amma.length },
+                { color: '#2563eb', text: 'AMMA-2 Positive Modulation (DB)  n=' + amma.length },
                 { color: '#dc2626', text: 'GRMS Positive Modulation  n=' + grms.length }
             ];
             ctx.save();
@@ -1866,7 +1899,8 @@ DASHBOARD_HTML: str = """
             }
 
             // Vertical grid at round clock times (e.g. every 15 minutes), plus window edges.
-            const step = pickTickStep(xMax - xMin);
+            let step = pickTickStep(xMax - xMin);
+            while ((xMax - xMin) / step > 24) step *= 2;   // never draw hundreds of overlapping gridlines
             const dayStart = new Date(new Date(xMin).setHours(0, 0, 0, 0)).getTime();
             const firstTick = dayStart + Math.ceil((xMin - dayStart) / step) * step;
             ctx.textAlign = 'center';
@@ -1922,7 +1956,7 @@ DASHBOARD_HTML: str = """
             if (!box) return;
             box.innerHTML = '';
             [
-                { name: 'AMMA-2 (DA)', cls: 'amma-dot', stats: summarizeSeries(amma) },
+                { name: 'AMMA-2 (DB)', cls: 'amma-dot', stats: summarizeSeries(amma) },
                 { name: 'GRMS', cls: 'grms-dot', stats: summarizeSeries(grms) }
             ].forEach(series => {
                 const item = document.createElement('div');
@@ -1972,9 +2006,11 @@ DASHBOARD_HTML: str = """
             const all = amma.concat(grms);
             const times = all.map(p => p.time);
             const win = windowBounds(Math.min(...times));
-            // Fixed broadcast-window axis; widen only if a reading falls outside it.
-            let xMin = Math.min(win.start, ...times);
-            let xMax = Math.max(win.end, ...times);
+            // Use the fixed broadcast-window axis when readings fall inside it;
+            // otherwise fit the axis to the uploaded data's own time range.
+            const inWindow = times.some(t => t >= win.start && t <= win.end);
+            let xMin = inWindow ? Math.min(win.start, ...times) : Math.min(...times);
+            let xMax = inWindow ? Math.max(win.end, ...times) : Math.max(...times);
             if (xMax <= xMin) { xMin -= 60000; xMax += 60000; }
 
             const values = all.map(p => p.value);
@@ -2018,6 +2054,13 @@ DASHBOARD_HTML: str = """
 
                 drawModulationChart(history, grms);
 
+                const alignNote = document.getElementById('alignNote');
+                const al = comparison.alignment;
+                alignNote.innerText = (al && al.from)
+                    ? 'Note: the GRMS file is dated ' + al.from + ' and the AMMA-2 file ' + al.to +
+                      '. GRMS was moved to the AMMA-2 date so the same clock times line up.'
+                    : '';
+
                 const status = document.getElementById('uploadStatus');
                 if (grms.length) {
                     status.innerText = 'GRMS data loaded: ' + grms.length + ' points.';
@@ -2046,7 +2089,7 @@ DASHBOARD_HTML: str = """
                 const response = await fetch('/upload-amma', { method: 'POST', body: formData });
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.error || 'Upload failed.');
-                status.innerText = 'AMMA-2 upload successful: ' + result.rows + ' points in 17:58–20:50 UTC.';
+                status.innerText = 'AMMA-2 upload successful: ' + result.rows + ' points loaded.';
                 await refreshHistory();
             } catch (error) {
                 status.innerText = 'AMMA-2 upload failed: ' + error.message;
@@ -2167,12 +2210,14 @@ def api_comparison():
     except ValueError:
         hours = 24
     hours = max(1, min(hours, 24 * 30))
-    return jsonify(calculate_comparison(hours))
+    result = calculate_comparison(hours)
+    result["alignment"] = dict(grms_alignment)
+    return jsonify(result)
 
 
 @app.route('/upload-amma', methods=['POST'])
 def upload_amma():
-    """Accept an AMMA-2 CSV/XLSX export containing Timestamp + DA Positive Modulation."""
+    """Accept an AMMA-2 CSV/XLSX export containing Timestamp + DB Positive Modulation."""
     uploaded = request.files.get("file")
     if not uploaded or not uploaded.filename:
         return jsonify({"error": "No AMMA-2 file was selected."}), 400
@@ -2210,6 +2255,7 @@ def upload_grms():
         })
     except Exception as exc:
         logging.exception("GRMS upload failed")
+        return jsonify({"error": str(exc)}), )
         return jsonify({"error": str(exc)}), 400
 
 
